@@ -1,0 +1,12 @@
+﻿# Raw + processed logs / outputs
+newlogs/
+$OUT/
+_staging_Review/
+06_Logs/
+slip_src/
+__backup/
+__legacy_quarantine/
+
+# Python cache
+__pycache__/
+*.pyc

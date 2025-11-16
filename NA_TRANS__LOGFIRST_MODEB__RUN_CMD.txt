@@ -1,0 +1,224 @@
+From a PowerShell prompt in C:\tuning\logs, run:
+
+    $ErrorActionPreference = 'Stop'
+
+    $NEWLOGS      = 'newlogs'
+    $CLEANED      = Join-Path $NEWLOGS 'cleaned'
+    $OUT_ROOT     = Join-Path $NEWLOGS 'output'
+    $STAGING      = Join-Path $NEWLOGS '_staging_Review'
+    $BASELINE_DIR = Join-Path $NEWLOGS 'baseline_current'
+
+    Write-Host "`n[NA_TRANS] LOG-FIRST MODE-B full pipeline starting..." -ForegroundColor Cyan
+
+    #------------------------------------------------------------
+    # STEP 0: Clean pipeline dirs (keep raw .csv + baseline_current)
+    #------------------------------------------------------------
+    if (-not (Test-Path $NEWLOGS)) {
+        New-Item -ItemType Directory -Path $NEWLOGS | Out-Null
+    }
+
+    foreach ($sub in @('cleaned','output','_staging_Review')) {
+        $p = Join-Path $NEWLOGS $sub
+        if (Test-Path $p) { Remove-Item $p -Recurse -Force }
+    }
+
+    # Remove non-CSV files directly under newlogs (does NOT touch baseline_current dir)
+    Get-ChildItem $NEWLOGS -File | Where-Object { $_.Extension -ne '.csv' } | ForEach-Object {
+        Remove-Item $_.FullName -Force
+    }
+
+    if (-not (Test-Path $BASELINE_DIR)) {
+        Write-Host "[ERROR] Baseline dir not found: $BASELINE_DIR" -ForegroundColor Red
+        Write-Host "        Expected SHIFT/TCC *_Throttle17.tsv in newlogs\baseline_current." -ForegroundColor Red
+        return
+    }
+
+    $rawLogs = Get-ChildItem $NEWLOGS -File -Filter '*.csv'
+    if (-not $rawLogs) {
+        Write-Host "[ERROR] No raw .csv logs found in '$NEWLOGS'." -ForegroundColor Red
+        return
+    }
+
+    Write-Host "[STEP 0] Found raw logs:" -ForegroundColor Yellow
+    $rawLogs | ForEach-Object { Write-Host ("   " + $_.Name) }
+
+    #------------------------------------------------------------
+    # STEP 1: CLEAN_FULL wrapper (FULL-only, strict/no-fallback)
+    #------------------------------------------------------------
+    Write-Host "`n[STEP 1] CLEAN_FULL wrapper..." -ForegroundColor Yellow
+
+    python ".\clean_full_only_wrapper__PB_MP__QUIET.py" `
+        --raw-glob    (Join-Path $NEWLOGS '*.csv') `
+        --cleaner     ".\trans_clean_analyze__SAFE_REBUILD.py" `
+        --staging     $STAGING `
+        --cleaned-dir $CLEANED `
+        --out-root    $OUT_ROOT `
+        --workers     6
+
+    Write-Host "[STEP 1] CLEAN_FULL completed." -ForegroundColor Green
+
+    #------------------------------------------------------------
+    # STEP 2: Gear canon
+    #------------------------------------------------------------
+    Write-Host "`n[STEP 2] Gear canonicalization..." -ForegroundColor Yellow
+    python ".\na_trans_step2_gear_canon.py"
+    Write-Host "[STEP 2] Gear canon done." -ForegroundColor Green
+
+    #------------------------------------------------------------
+    # STEP 3: RAWEDGES SHIFT
+    #------------------------------------------------------------
+    Write-Host "`n[STEP 3] RAWEDGES SHIFT build..." -ForegroundColor Yellow
+    python ".\na_trans_step3_rawedges_shift.py"
+    Write-Host "[STEP 3] RAWEDGES SHIFT tables written under newlogs\output\01_tables\shift." -ForegroundColor Green
+
+    #------------------------------------------------------------
+    # STEP 4: TCC from slip (50/120 rpm EC3)
+    #------------------------------------------------------------
+    Write-Host "`n[STEP 4] TCC APPLY/RELEASE build (50/120 rpm EC3)..." -ForegroundColor Yellow
+    python ".\na_trans_step4_tcc_from_slip_50_120.py"
+    Write-Host "[STEP 4] TCC tables written under newlogs\output\01_tables\tcc." -ForegroundColor Green
+
+    #------------------------------------------------------------
+    # STEP 5A: Build LOG-FIRST baseline tables (guarded) from RAWEDGES/TCC
+    #------------------------------------------------------------
+    Write-Host "`n[STEP 5A] Building LOG-FIRST baseline tables from RAWEDGES/TCC..." -ForegroundColor Yellow
+    python ".\na_trans_step5_build_baseline_logfirst.py"
+    Write-Host "[STEP 5A] LOG-FIRST baseline tables written under newlogs\output\01_tables\BASELINE_LOGFIRST." -ForegroundColor Green
+
+    #------------------------------------------------------------
+    # STEP 5B: Run passes (STOPGO, KICKDOWN, CORNER, LAT, INTENT, etc.)
+    #------------------------------------------------------------
+    Write-Host "`n[STEP 5B] Running passes (STOPGO, KICKDOWN, CORNER, LAT, INTENT)..." -ForegroundColor Cyan
+
+    if (Test-Path ".\na_trans_step5_run_passes.ps1") {
+        & ".\na_trans_step5_run_passes.ps1"
+    } else {
+        Write-Host "[ERROR] na_trans_step5_run_passes.ps1 not found in C:\tuning\logs" -ForegroundColor Red
+        Write-Host "        Make sure the LOGFIRST_MODEB pipeline bundle is unpacked here." -ForegroundColor Red
+        return
+    }
+
+    #------------------------------------------------------------
+    # STEP 6: MODE-B blend (baseline_current + LOG-FIRST + passes)
+    #------------------------------------------------------------
+    Write-Host "`n[STEP 6] MODE-B blend (baseline_current + LOG-FIRST + passes)..." -ForegroundColor Yellow
+    python ".\na_trans_step6_blend_modeb.py"
+    Write-Host "[STEP 6] Blended tables written under newlogs\output\01_tables\BLENDED_LOGOVERBASE." -ForegroundColor Green
+
+    #------------------------------------------------------------
+    # STEP 6A: Post-blend audit to AUDITFIX
+    #------------------------------------------------------------
+    $BLEND_DIR      = Join-Path $OUT_ROOT '01_tables\BLENDED_LOGOVERBASE'
+    $blendShiftUp   = Join-Path $BLEND_DIR 'SHIFT_TABLES__UP__Throttle17.tsv'
+    $blendShiftDown = Join-Path $BLEND_DIR 'SHIFT_TABLES__DOWN__Throttle17.tsv'
+    $blendTccApply  = Join-Path $BLEND_DIR 'TCC_APPLY__Throttle17.tsv'
+    $blendTccRel    = Join-Path $BLEND_DIR 'TCC_RELEASE__Throttle17.tsv'
+
+    foreach ($p in @($blendShiftUp, $blendShiftDown, $blendTccApply, $blendTccRel)) {
+        if (-not (Test-Path $p)) {
+            Write-Host "[ERROR] Expected blended table not found: $p" -ForegroundColor Red
+            return
+        }
+    }
+
+    Write-Host "`n[STEP 6A] Auditing BLENDED_LOGOVERBASE tables -> AUDITFIX..." -ForegroundColor Yellow
+    $AUDIT_DIR = Join-Path $BLEND_DIR 'AUDITFIX'
+    python ".\table_audit_and_fix.py" `
+        --up          $blendShiftUp `
+        --down        $blendShiftDown `
+        --tcc-apply   $blendTccApply `
+        --tcc-release $blendTccRel `
+        --out-dir     $AUDIT_DIR
+
+    #------------------------------------------------------------
+    # STEP 6B: Smoothing SHIFT/TCC tables (monotonic vs TPS) -> SMOOTH
+    #------------------------------------------------------------
+    Write-Host "`n[STEP 6B] Smoothing SHIFT/TCC tables -> SMOOTH..." -ForegroundColor Yellow
+    python ".\na_trans_smooth_tables.py"
+
+    #------------------------------------------------------------
+    # STEP 6C: TSV guard + strict 0.1 mph + final audit -> AUDITFIX_SMOOTH
+    #------------------------------------------------------------
+    $SMOOTH_DIR = Join-Path $BLEND_DIR 'SMOOTH'
+    Write-Host "`n[STEP 6C] Normalizing SMOOTH tables..." -ForegroundColor Yellow
+    python ".\tsv_escape_guard.py" --dir $SMOOTH_DIR
+
+    python ".\force_1dp__STRICT_SHIFT.py" `
+        --up   (Join-Path $SMOOTH_DIR 'SHIFT_TABLES__UP__Throttle17.tsv') `
+        --down (Join-Path $SMOOTH_DIR 'SHIFT_TABLES__DOWN__Throttle17.tsv')
+
+    python ".\force_1dp__STRICT_TCC.py" `
+        --apply   (Join-Path $SMOOTH_DIR 'TCC_APPLY__Throttle17.tsv') `
+        --release (Join-Path $SMOOTH_DIR 'TCC_RELEASE__Throttle17.tsv')
+
+    Write-Host "`n[STEP 6C] Auditing SMOOTH tables -> AUDITFIX_SMOOTH..." -ForegroundColor Yellow
+    $AUDIT_SMOOTH_DIR = Join-Path $BLEND_DIR 'AUDITFIX_SMOOTH'
+    python ".\table_audit_and_fix.py" `
+        --up          (Join-Path $SMOOTH_DIR 'SHIFT_TABLES__UP__Throttle17.tsv') `
+        --down        (Join-Path $SMOOTH_DIR 'SHIFT_TABLES__DOWN__Throttle17.tsv') `
+        --tcc-apply   (Join-Path $SMOOTH_DIR 'TCC_APPLY__Throttle17.tsv') `
+        --tcc-release (Join-Path $SMOOTH_DIR 'TCC_RELEASE__Throttle17.tsv') `
+        --out-dir     $AUDIT_SMOOTH_DIR
+
+    #------------------------------------------------------------
+    # STEP 6D: Cross-gear consistency on SHIFT UP
+    #------------------------------------------------------------
+    Write-Host "`n[STEP 6D] Enforcing cross-gear consistency on SHIFT UP..." -ForegroundColor Yellow
+    python ".\na_trans_crossgear_fix.py"
+
+    #------------------------------------------------------------
+    # STEP 7: Build flash pack ZIP from AUDITFIX_SMOOTH
+    #------------------------------------------------------------
+    Write-Host "`n[STEP 7] Building flash pack from AUDITFIX_SMOOTH..." -ForegroundColor Yellow
+
+    $FLASH_ROOT = Join-Path $OUT_ROOT '03_flash_pack'
+    $PACK       = Join-Path $FLASH_ROOT 'LOGFIRST_MODEB'
+    $PACK_SHIFT = Join-Path $PACK '01_tables\shift'
+    $PACK_TCC   = Join-Path $PACK '01_tables\tcc'
+
+    $FINAL_DIR      = Join-Path $BLEND_DIR 'AUDITFIX_SMOOTH'
+    $finalShiftUp   = Join-Path $FINAL_DIR 'SHIFT_TABLES__UP__Throttle17.tsv'
+    $finalShiftDown = Join-Path $FINAL_DIR 'SHIFT_TABLES__DOWN__Throttle17.tsv'
+    $finalTccApply  = Join-Path $FINAL_DIR 'TCC_APPLY__Throttle17.tsv'
+    $finalTccRel    = Join-Path $FINAL_DIR 'TCC_RELEASE__Throttle17.tsv'
+
+    foreach ($p in @($finalShiftUp, $finalShiftDown, $finalTccApply, $finalTccRel)) {
+        if (-not (Test-Path $p)) {
+            Write-Host "[ERROR] Expected final table not found: $p" -ForegroundColor Red
+            return
+        }
+    }
+
+    New-Item -ItemType Directory -Path $FLASH_ROOT,$PACK,$PACK_SHIFT,$PACK_TCC -Force | Out-Null
+
+    Copy-Item $finalShiftUp   $PACK_SHIFT -Force
+    Copy-Item $finalShiftDown $PACK_SHIFT -Force
+    Copy-Item $finalTccApply  $PACK_TCC   -Force
+    Copy-Item $finalTccRel    $PACK_TCC   -Force
+
+    $stamp  = Get-Date -Format 'yyyyMMdd_HHmm'
+    $zipOut = Join-Path $FLASH_ROOT ("NA_TRANS__LOGFIRST_MODEB_SMOOTH_XGEAR__FLASH_PACK__{0}.zip" -f $stamp)
+
+    Write-Host "[TCC_1DP] Fixing TCC tables in pack before zipping..." -ForegroundColor Yellow
+    $tccDir = Join-Path $PACK "01_tables\tcc"
+    python ".\tcc_pack_force_1dp.py" $tccDir
+
+    if (Test-Path $zipOut) { Remove-Item $zipOut -Force }
+    Compress-Archive -Path (Join-Path $PACK '*') -DestinationPath $zipOut -Force
+
+    Write-Host "`n[OK] LOG-FIRST MODE-B SMOOTH+XGEAR flash pack ready:" -ForegroundColor Green
+    Write-Host "     $zipOut" -ForegroundColor Green
+
+    Write-Host "`n[NA_TRANS] Full pipeline complete." -ForegroundColor Cyan
+
+    #------------------------------------------------------------
+    # STEP 8: Harsh-shift scan (debug only, does NOT change tables)
+    #------------------------------------------------------------
+    Write-Host "`n[STEP 8] Scanning CLEAN_FULL logs for harsh shifts..." -ForegroundColor Yellow
+
+    if (Test-Path ".\na_trans_scan_harsh_shifts.py") {
+        python ".\na_trans_scan_harsh_shifts.py"
+        Write-Host "`n[STEP 8] HARSH_SHIFT_EVENTS.tsv written to newlogs\output\DEBUG" -ForegroundColor Green
+    } else {
+        Write-Host "[WARN] na_trans_scan_harsh_shifts.py not found; skipping harsh scan." -ForegroundColor Yellow
+    }
