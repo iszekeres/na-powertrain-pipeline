@@ -79,26 +79,91 @@ BRAKE_PRESSURE_THRESHOLD = 15.0  # kPa; above this = brake ON
 
 def derive_brake_flag(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Always derive a binary brake flag from brake pressure.
+    Derive a binary brake flag with strict/no-fallback semantics.
 
-    Raw logs are expected to have 'Brake Pressure (kPa)' or 'Brake Pressure'.
+    Priority:
+      1) Brake Pedal channel (binary or %):
+           - Exact 'Brake Pedal' (case-insensitive), or
+           - Any column whose name contains both 'brake' and 'pedal'.
+         If values look like a percentage (range > ~1.5), treat as 0–100 and
+         use >5% as "pressed". Otherwise, treat non-zero as pressed.
+      2) Fallback: analog brake pressure in BRAKE_PRESSURE_ALIASES
+         using BRAKE_PRESSURE_THRESHOLD. Emits a warning.
+      3) If neither exists, raise a clear error (no silent fallback).
     Output column 'brake' is strict 0/1 (0 = off, 1 = on).
     """
+    # 1) Prefer a Brake Pedal-style channel
+    pedal_col = None
+    lower_cols = {str(c).lower(): c for c in df.columns}
+    # exact match first
+    for name_lower, orig in lower_cols.items():
+        if name_lower == "brake pedal":
+            pedal_col = orig
+            break
+    if pedal_col is None:
+        # any column containing both "brake" and "pedal"
+        for name_lower, orig in lower_cols.items():
+            if "brake" in name_lower and "pedal" in name_lower:
+                pedal_col = orig
+                break
+
+    if pedal_col is not None:
+        raw = df[pedal_col]
+        num = pd.to_numeric(raw, errors="coerce")
+        if num.notna().any():
+            max_val = float(num.max())
+            if max_val > 1.5:
+                # Treat as percentage or similar; threshold at >5%
+                df["brake"] = (num > 5.0).astype(int)
+            else:
+                # Treat as binary-ish; any non-zero is pressed
+                df["brake"] = (num != 0).astype(int)
+        else:
+            # Non-numeric but present; treat common textual booleans
+            s = raw.astype(str).str.strip().str.lower()
+            df["brake"] = s.isin(["on", "true", "pressed", "1"]).astype(int)
+        return df
+
+    # 2) Fallback: analog brake pressure (older logs)
     src = None
     for c in BRAKE_PRESSURE_ALIASES:
         if c in df.columns:
             src = c
             break
 
-    if src is None:
-        raise SystemExit(
-            "[ERROR] No brake pressure column found. "
-            "Expected one of: 'Brake Pressure (kPa)' or 'Brake Pressure'."
+    if src is not None:
+        print(
+            "[WARN] Using analog brake pressure fallback for brake "
+            "(no 'Brake Pedal' channel found)."
         )
+        bp = pd.to_numeric(df[src], errors="coerce")
+        df["brake"] = (bp > BRAKE_PRESSURE_THRESHOLD).astype(int)
+        return df
 
-    bp = pd.to_numeric(df[src], errors="coerce")
-    df["brake"] = (bp > BRAKE_PRESSURE_THRESHOLD).astype(int)
-    return df
+    # 3) Hard failure: no usable brake signal
+    raise SystemExit(
+        "[ERROR] No usable brake channel found. "
+        "Expected a 'Brake Pedal' style channel or one of: "
+        f"{BRAKE_PRESSURE_ALIASES}."
+    )
+
+
+def ffill_with_gap(time_s, series, max_gap=1.0):
+    """
+    Forward-fill with a maximum allowed temporal gap.
+
+    - time_s: 1D array-like of seconds (monotonic increasing preferred)
+    - series: pandas Series to forward-fill
+    - max_gap: maximum allowed age (in seconds) for a carried value;
+               beyond this, values are set back to NaN.
+    """
+    t = pd.to_numeric(time_s, errors="coerce")
+    s = pd.to_numeric(series, errors="coerce")
+    last_valid_time = t.where(s.notna()).ffill()
+    s_ff = s.ffill()
+    age = t - last_valid_time
+    s_ff[age > max_gap] = pd.NA
+    return s_ff
 
 
 def _lock_thr_temp_F(tf):
@@ -279,25 +344,214 @@ def _add_tcc_softlock(clean_df):
     clean_df["tcc_locked_built"] = built
     return clean_df
 
-def _shift_events(clean_df):
-    se = []
-    if "gear_actual" not in clean_df.columns: return pd.DataFrame(se)
-    g = pd.to_numeric(clean_df["gear_actual"], errors="coerce").round().astype("Int64").ffill()
-    chg = g != g.shift(1)
-    idx = np.where(chg.fillna(False))[0]
-    for i in idx:
-        if i==0: continue
-        frm = g.iat[i-1]; to = g.iat[i]
-        if pd.isna(frm) or pd.isna(to) or frm==to: continue
-        mph = float(pd.to_numeric(clean_df["speed_mph"], errors="coerce").iat[i]) if "speed_mph" in clean_df else np.nan
-        tps = float(pd.to_numeric(clean_df["throttle_pct"], errors="coerce").iat[i]) if "throttle_pct" in clean_df else np.nan
-        ts  = float(pd.to_numeric(clean_df["offset"], errors="coerce").iat[i]) if "offset" in clean_df else np.nan
-        se.append({"time_s":ts,"from":int(frm),"to":int(to),"mph":mph,"tps":tps})
-    return pd.DataFrame(se)
+
+def _shift_events(full_df: pd.DataFrame, tag: str = "<unknown>") -> pd.DataFrame:
+    """
+    Build SHIFT_EVENTS v2 from a CLEAN_FULL-like dataframe.
+
+    Uses canonical columns:
+      - time_s
+      - gear_actual, gear_cmd   (0–6 after canon/step-hold)
+      - speed_mph, throttle_pct, pedal_pct (optional)
+      - engine_rpm, turbine_rpm (optional)
+      - tcc_slip_fused, tcc_locked_built
+      - brake
+      - mode_trans (optional, any trans mode channel)
+
+    For each commanded gear change (UP/DOWN between 1–6):
+      - t_cmd: time of gear_cmd edge
+      - t_act: time when gear_actual settles to new gear
+      - t_event: midpoint 0.5 * (t_cmd + t_act)
+      - Samples *_event fields via merge_asof on time_s.
+      - Computes shift_duration_s, tcc_slip_max, harshness_metric (placeholder),
+        mode_trans, brake_event, tcc_locked_start.
+    """
+    required = [
+        "time_s",
+        "gear_actual",
+        "gear_cmd",
+        "speed_mph",
+        "throttle_pct",
+        "brake",
+        "tcc_slip_fused",
+        "tcc_locked_built",
+    ]
+    missing = [c for c in required if c not in full_df.columns]
+    if missing:
+        raise SystemExit(
+            f"[ERROR] SHIFT_EVENTS v2 missing required columns in FULL: {missing}"
+        )
+
+    df = full_df.copy()
+    df["time_s"] = pd.to_numeric(df["time_s"], errors="coerce")
+    df = df.dropna(subset=["time_s"]).sort_values("time_s").reset_index(drop=True)
+
+    for col in [
+        "gear_actual",
+        "gear_cmd",
+        "speed_mph",
+        "throttle_pct",
+        "pedal_pct",
+        "engine_rpm",
+        "turbine_rpm",
+        "tcc_slip_fused",
+        "brake",
+        "tcc_locked_built",
+    ]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Step-hold for discrete gear series.
+    for col in ["gear_actual", "gear_cmd"]:
+        df[col] = df[col].ffill()
+
+    ts = df["time_s"].to_numpy()
+    g_cmd = df["gear_cmd"].to_numpy()
+    g_act = df["gear_actual"].to_numpy()
+    slip = df["tcc_slip_fused"].to_numpy()
+    locked = df["tcc_locked_built"].to_numpy()
+
+    SHIFT_UP_PAIRS = [(1, 2), (2, 3), (3, 4), (4, 5), (5, 6)]
+    SHIFT_DN_PAIRS = [(2, 1), (3, 2), (4, 3), (5, 4), (6, 5)]
+    VALID_PAIRS = set(SHIFT_UP_PAIRS + SHIFT_DN_PAIRS)
+
+    events_meta = []
+    n = len(df)
+    min_stable_samples = 3
+
+    for i in range(1, n):
+        prev_cmd = g_cmd[i - 1]
+        curr_cmd = g_cmd[i]
+        if np.isnan(prev_cmd) or np.isnan(curr_cmd):
+            continue
+        if prev_cmd == curr_cmd:
+            continue
+        pair = (int(prev_cmd), int(curr_cmd))
+        if pair not in VALID_PAIRS:
+            continue
+
+        # Commanded shift from prev_cmd -> curr_cmd at index i
+        t_cmd = ts[i]
+
+        # Find when actual gear settles to the new gear.
+        target = curr_cmd
+        j_act = None
+        j = i
+        while j <= n - min_stable_samples:
+            window = g_act[j : j + min_stable_samples]
+            if np.all(window == target):
+                j_act = j
+                break
+            j += 1
+
+        if j_act is None:
+            # No clear settle point; skip this event.
+            continue
+
+        t_act = ts[j_act]
+        t_event = 0.5 * (t_cmd + t_act)
+
+        # TCC slip metrics over [i, j_act]
+        lo = i
+        hi = j_act
+        if hi < lo:
+            hi = lo
+        window_slip = slip[lo : hi + 1]
+        if window_slip.size and np.isfinite(window_slip).any():
+            tcc_slip_max = float(np.nanmax(window_slip))
+        else:
+            tcc_slip_max = np.nan
+
+        tcc_locked_start = (
+            float(locked[i]) if i < len(locked) and np.isfinite(locked[i]) else np.nan
+        )
+        shift_duration_s = float(t_act - t_cmd)
+
+        events_meta.append(
+            {
+                "time_s": t_event,
+                "from_gear": int(prev_cmd),
+                "to_gear": int(curr_cmd),
+                "t_cmd": t_cmd,
+                "t_act": t_act,
+                "shift_duration_s": shift_duration_s,
+                "tcc_slip_max": tcc_slip_max,
+                # Placeholder for now; can be refined later.
+                "harshness_metric": 0.0,
+                "tcc_locked_start": tcc_locked_start,
+            }
+        )
+
+    cols_final = [
+        "time_s",
+        "from_gear",
+        "to_gear",
+        "speed_mph_event",
+        "throttle_pct_event",
+        "pedal_pct_event",
+        "engine_rpm_event",
+        "turbine_rpm_event",
+        "shift_duration_s",
+        "tcc_slip_max",
+        "harshness_metric",
+        "mode_trans",
+        "brake_event",
+        "tcc_locked_start",
+    ]
+
+    if not events_meta:
+        print(f"[WARN] No shift events detected in CLEAN_FULL for {tag}.")
+        return pd.DataFrame(columns=cols_final)
+
+    events_df = pd.DataFrame(events_meta)
+    events_df = events_df.sort_values("time_s").reset_index(drop=True)
+
+    # Sample canonical channels at t_event via merge_asof.
+    sample_cols = [
+        "speed_mph",
+        "throttle_pct",
+        "pedal_pct",
+        "engine_rpm",
+        "turbine_rpm",
+        "brake",
+    ]
+    if "mode_trans" in df.columns:
+        sample_cols.append("mode_trans")
+
+    present = [c for c in sample_cols if c in df.columns]
+    slim = df[["time_s"] + present].copy()
+    slim = slim.sort_values("time_s").reset_index(drop=True)
+
+    merged = pd.merge_asof(
+        events_df.sort_values("time_s").reset_index(drop=True),
+        slim,
+        on="time_s",
+        direction="nearest",
+    )
+
+    # Rename sampled columns to *_event, except for mode_trans.
+    rename_map = {}
+    for c in present:
+        if c == "mode_trans":
+            continue
+        if c == "brake":
+            rename_map[c] = "brake_event"
+        else:
+            rename_map[c] = f"{c}_event"
+    merged = merged.rename(columns=rename_map)
+
+    # Ensure all expected columns exist, even if optional ones are missing.
+    for col in cols_final:
+        if col not in merged.columns:
+            merged[col] = np.nan
+
+    merged = merged[cols_final]
+    return merged
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--in-glob", required=True)
+    ap.add_argument("--in", dest="in_single", help="Single input raw CSV")
+    ap.add_argument("--in-glob", help="Glob for input raw CSVs")
     ap.add_argument("--out-dir", required=True)
     ap.add_argument(
         "--progress",
@@ -321,10 +575,21 @@ def main():
     except Exception:
         pass
 
+    if not args.in_single and not args.in_glob:
+        raise SystemExit("[ERROR] One of --in or --in-glob is required.")
+    if args.in_single and args.in_glob:
+        raise SystemExit("[ERROR] Use only one of --in or --in-glob, not both.")
+
     os.makedirs(args.out_dir, exist_ok=True)
-    paths = sorted(glob.glob(args.in_glob))
+
+    if args.in_single:
+        paths = [args.in_single]
+    else:
+        paths = sorted(glob.glob(args.in_glob))
+
     if not paths:
-        print(f"[INFO] No raw CSVs in {args.in_glob} - nothing to do."); return
+        which = args.in_single if args.in_single else args.in_glob
+        print(f"[INFO] No raw CSVs in {which} - nothing to do."); return
 
     for raw in paths:
         try:
@@ -333,7 +598,7 @@ def main():
 
             df = pd.read_csv(raw, encoding="utf-8-sig", low_memory=False)
 
-            # Ensure a time_s column exists for downstream RAWEDGES/TCC builders.
+            # Ensure a time_s column exists for downstream builders.
             if "time_s" not in df.columns:
                 cols_lower = {c.lower(): c for c in df.columns}
                 for cand in ["time_s", "offset", "Time (s)", "time", "time_sec"]:
@@ -342,9 +607,55 @@ def main():
                         df["time_s"] = df[cols_lower[key]]
                         break
 
+            if "time_s" not in df.columns:
+                raise SystemExit(
+                    "[ERROR] Could not derive time_s; expected one of "
+                    "['time_s','offset','Time (s)','time','time_sec']."
+                )
+
+            df["time_s"] = pd.to_numeric(df["time_s"], errors="coerce")
+            if df["time_s"].isna().all():
+                raise SystemExit("[ERROR] time_s column is all NaN.")
+
+            # Use time_s as the canonical time axis and offset.
+            df = df.sort_values("time_s").reset_index(drop=True)
+            df["offset"] = df["time_s"]
+
             df = derive_brake_flag(df)
             clean_df, map_df = _map_df(df)
+
+            # Add canonical time axis into clean_df.
+            clean_df["time_s"] = df["time_s"].values
+
+            # Apply neutral ffill-with-gap for key continuous signals.
+            t = clean_df["time_s"]
+            for col in ["speed_mph", "throttle_pct", "pedal_pct"]:
+                if col in clean_df.columns:
+                    clean_df[col] = ffill_with_gap(t, clean_df[col])
+
+            # Step-hold for discrete gear series.
+            for col in ["gear_actual", "gear_cmd"]:
+                if col in clean_df.columns:
+                    clean_df[col] = pd.to_numeric(clean_df[col], errors="coerce").ffill()
+
             clean_df = _add_tcc_softlock(clean_df)
+
+            # CLEAN_FULL v2 required canonical columns.
+            required_v2 = [
+                "time_s",
+                "speed_mph",
+                "throttle_pct",
+                "gear_actual",
+                "gear_cmd",
+                "brake",
+                "tcc_slip_fused",
+                "tcc_locked_built",
+            ]
+            missing_v2 = [c for c in required_v2 if c not in clean_df.columns]
+            if missing_v2:
+                raise SystemExit(
+                    f"[ERROR] CLEAN_FULL v2 missing required canonical columns: {missing_v2}"
+                )
 
             clean_path = os.path.join(args.out_dir, f"__trans_focus__clean__{tag}__{stamp}.csv")
             full_path  = os.path.join(args.out_dir, f"__trans_focus__clean_FULL__{tag}__{stamp}.csv")
@@ -359,10 +670,27 @@ def main():
             merged = df.copy()
             for c in clean_df.columns:
                 merged[f"{c}__canon"] = clean_df[c]
+
+            # Add unsuffixed v2 canonical columns for convenience.
+            direct = [
+                "time_s",
+                "speed_mph",
+                "throttle_pct",
+                "pedal_pct",
+                "gear_actual",
+                "gear_cmd",
+                "brake",
+                "tcc_slip_fused",
+                "tcc_locked_built",
+            ]
+            for c in direct:
+                if c in clean_df.columns:
+                    merged[c] = clean_df[c]
+
             merged.to_csv(full_path, index=False)
 
-            # shift events
-            se = _shift_events(clean_df)
+            # shift events v2 from FULL
+            se = _shift_events(merged, tag=tag)
             se.to_csv(shift_path, index=False)
 
             # mapping
@@ -373,9 +701,9 @@ def main():
             lines.append("non-null counts -> " + ", ".join([f"{c}:{int(pd.to_numeric(clean_df[c], errors='coerce').notna().sum())}" for c in clean_df.columns]))
             lines.append("shift pair counts:")
             if not se.empty:
-                counts = se.groupby(["from","to"]).size().reset_index(name="count").sort_values("count", ascending=False)
+                counts = se.groupby(["from_gear","to_gear"]).size().reset_index(name="count").sort_values("count", ascending=False)
                 for _,r in counts.iterrows():
-                    lines.append(f"  {int(r['from'])} -> {int(r['to'])}: {int(r['count'])}")
+                    lines.append(f"  {int(r['from_gear'])} -> {int(r['to_gear'])}: {int(r['count'])}")
             with open(sum_path,"w",encoding="utf-8") as f:
                 f.write("\n".join(lines))
 
