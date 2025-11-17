@@ -1,5 +1,28 @@
 From a PowerShell prompt in C:\tuning\logs, run:
 
+    #------------------------------------------------------------
+    # NA_Trans LOG-FIRST / MODE-B / Weekly Epoch Usage
+    #
+    # This run command is designed to be used at the END of a
+    # weekly "epoch":
+    #
+    #   - Keep the same SHIFT/TCC tables flashed on the truck
+    #     for the whole week.
+    #   - Collect logs all week under C:\tuning\na-trans-data\newlogs
+    #     (via the C:\tuning\logs\newlogs junction).
+    #   - At the end of the week, run this script once over all
+    #     logs to build new tables and a FLASH PACK.
+    #   - Flash the new tables for the next week.
+    #
+    # It is also OK to run this script in the middle of a week
+    # on a single log as a DIAGNOSTIC RUN, but in that case you
+    # should:
+    #   - Treat the outputs (tables, passes) as "for review only".
+    #   - NOT blindly flash them to the truck.
+    #
+    # See NA_TRANS__WEEKLY_EPOCH_README.txt for the full policy.
+    #------------------------------------------------------------
+
     $ErrorActionPreference = 'Stop'
 
     $NEWLOGS      = 'newlogs'
