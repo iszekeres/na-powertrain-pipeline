@@ -59,7 +59,8 @@ $mapping = @{
     "trans_service.txt" = "docs\trans_service.txt";
     "transcripts.txt" = "docs\transcripts.txt";
     # SKIP: "2015_tahoe_t43_trans_tables.zip" (duplicate of the YAML)
-    "EC³ Torque Converter Clutch Strategy for a 6L80 in a Heavy SUV.pdf" = "docs\reference\EC³ Torque Converter Clutch Strategy for a 6L80 in a Heavy SUV.pdf";
+    "EC³ Torque Converter Clutch Strategy for a 6L80 in a Heavy SUV.pdf"  = "docs\reference\ECA3 Torque Converter Clutch Strategy for a 6L80 in a Heavy SUV.pdf";
+    "ECA3 Torque Converter Clutch Strategy for a 6L80 in a Heavy SUV.pdf" = "docs\reference\ECA3 Torque Converter Clutch Strategy for a 6L80 in a Heavy SUV.pdf";
     "NA_Trans_Project_Memories_Export__2025-11-19.txt" = "docs\NA_Trans_Project_Memories_Export__2025-11-19.txt";
     "NA_Trans_Project_README__Export_Notes.txt" = "docs\NA_Trans_Project_README__Export_Notes.txt";
 }
