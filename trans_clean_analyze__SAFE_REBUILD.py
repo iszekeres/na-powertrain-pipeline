@@ -69,6 +69,113 @@ def install_pd_read_csv_progress(args):
     print(f"[progress] enabled (chunksize={getattr(args,'chunksize',0)})", flush=True)
 # === END PROGRESS HELPERS ===
 
+
+def find_shift_mode_column(columns):
+    """
+    Try to find a shift-mode column by normalizing names:
+    lowercasing and stripping spaces/underscores.
+
+    We are looking for variants of 'Trans Shift Mode'.
+    """
+    normalized = {}
+    for col in columns:
+        key = col.lower().replace(" ", "").replace("_", "")
+        normalized[key] = col
+
+    candidates = []
+
+    # Direct normalized key matches
+    for key, original in normalized.items():
+        if key in (
+            "transshiftmode",
+            "transshiftmodechannel",
+            "trans_shift_mode",
+            "transshiftmodea",
+        ):
+            candidates.append(original)
+
+    # Also accept exact-ish readable names like "Trans Shift Mode"
+    for col in columns:
+        if col.lower().strip() == "trans shift mode":
+            candidates.append(col)
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            unique.append(c)
+
+    return unique[0] if unique else None
+
+
+def normalize_shift_mode(value):
+    """
+    Normalize raw shift-mode string into one of:
+        - 'pattern_a'
+        - 'normal'
+        - 'unknown'
+    """
+    if pd.isna(value):
+        return "unknown"
+    s = str(value).strip().lower()
+    # Treat anything with both "pattern" and "a" as PATTERN A
+    if "pattern" in s and "a" in s:
+        return "pattern_a"
+    if s == "normal":
+        return "normal"
+    return "unknown"
+
+
+def annotate_shift_mode(df, log_name=None):
+    """
+    Add canonical mode columns to the cleaned DataFrame, if we can find
+    a shift-mode column.
+
+    Adds:
+        - shift_mode_raw
+        - shift_mode_canon
+        - mode_profile
+        - mode_is_pattern_a
+
+    If no shift-mode column exists, leaves df unchanged.
+    """
+    mode_col = find_shift_mode_column(df.columns)
+    if mode_col is None:
+        msg = "[WARN] No shift-mode column found"
+        if log_name:
+            msg += f" in {log_name}"
+        msg += "; leaving mode_* columns absent for this file."
+        print(msg)
+        return df
+
+    raw = df[mode_col]
+    canon = raw.map(normalize_shift_mode)
+
+    df["shift_mode_raw"] = raw
+    df["shift_mode_canon"] = canon
+    df["mode_profile"] = canon.map(
+        {"pattern_a": "performance", "normal": "comfort"}
+    ).fillna("unknown")
+    df["mode_is_pattern_a"] = (canon == "pattern_a").astype(int)
+
+    # Optional small summary
+    counts = canon.value_counts(dropna=False).to_dict()
+    normal_count = counts.get("normal", 0)
+    pattern_count = counts.get("pattern_a", 0)
+    unknown_count = counts.get("unknown", 0)
+
+    if log_name is None:
+        log_name = "<cleaned_df>"
+
+    print(
+        f"{log_name}: shift-mode counts -> "
+        f"normal={normal_count}, pattern_a={pattern_count}, unknown={unknown_count}"
+    )
+
+    return df
+
 FINAL_DRIVE = 3.08
 GEAR_RATIOS = {1:4.03, 2:2.36, 3:1.53, 4:1.15, 5:0.85, 6:0.67}
 _SUSTAIN_SEC = 0.4
@@ -785,6 +892,11 @@ def main():
             for c in direct:
                 if c in clean_df.columns:
                     merged[c] = clean_df[c]
+
+            # Before writing FULL cleaned CSV, add mode flags if possible.
+            merged = annotate_shift_mode(
+                merged, log_name=os.path.basename(full_path)
+            )
 
             merged.to_csv(full_path, index=False)
 
