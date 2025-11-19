@@ -5,6 +5,7 @@
 
 import argparse, glob, os
 from datetime import datetime
+import math
 import numpy as np, pandas as pd
 
 
@@ -328,7 +329,8 @@ def _map_df(df):
         out[c] = pd.to_numeric(out[c], errors="coerce")
 
     for k in KEEP_ORDER:
-        if k not in out.columns: out[k] = np.nan
+        if k not in out.columns:
+            out[k] = np.nan
     out = out[KEEP_ORDER]
     map_df = pd.DataFrame(mapping_rows)
     return out, map_df
@@ -624,6 +626,98 @@ def main():
             df = derive_brake_flag(df)
             clean_df, map_df = _map_df(df)
 
+            # --- SPEED CANON: build from Trans Output Shaft RPM and Vehicle Speed (SAE)
+            idx = df.index
+
+            has_sae = "Vehicle Speed (SAE)" in df.columns
+            has_oss = "Trans Output Shaft RPM" in df.columns
+
+            speed_sae = pd.Series(np.nan, index=idx, dtype="float64")
+            if has_sae:
+                speed_sae = pd.to_numeric(df["Vehicle Speed (SAE)"], errors="coerce")
+
+            speed_oss = pd.Series(np.nan, index=idx, dtype="float64")
+            if has_oss:
+                out_rpm = pd.to_numeric(df["Trans Output Shaft RPM"], errors="coerce")
+                tire_diameter_in = 32.5
+                tire_circ_in = math.pi * tire_diameter_in
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    wheel_rpm = out_rpm / FINAL_DRIVE
+                    speed_oss = (wheel_rpm * tire_circ_in * 60.0) / (12.0 * 5280.0)
+                speed_oss = pd.to_numeric(speed_oss, errors="coerce")
+
+            # Backward-compatible base speed from existing mapping, if present.
+            base_speed = clean_df.get("speed_mph")
+            if base_speed is None:
+                base_speed = pd.Series(np.nan, index=idx, dtype="float64")
+            else:
+                base_speed = pd.to_numeric(base_speed, errors="coerce").reindex(idx)
+
+            # Canonical selection per row:
+            #   1) speed_mph_outputshaft if finite and >0
+            #   2) speed_mph_sae         if finite and >0
+            #   3) previous speed_mph     if finite and >0 (legacy fallback)
+            speed_oss_valid = speed_oss.replace([np.inf, -np.inf], np.nan)
+            speed_sae_valid = speed_sae.replace([np.inf, -np.inf], np.nan)
+            base_speed_valid = base_speed.replace([np.inf, -np.inf], np.nan)
+
+            canon_speed = pd.Series(np.nan, index=idx, dtype="float64")
+
+            m_out = speed_oss_valid > 0
+            m_sae = (~m_out) & (speed_sae_valid > 0)
+            m_base = (~m_out) & (~m_sae) & (base_speed_valid > 0)
+
+            canon_speed[m_out] = speed_oss_valid[m_out]
+            canon_speed[m_sae] = speed_sae_valid[m_sae]
+            canon_speed[m_base] = base_speed_valid[m_base]
+
+            clean_df["speed_mph_sae"] = speed_sae_valid
+            clean_df["speed_mph_outputshaft"] = speed_oss_valid
+            clean_df["speed_mph__canon"] = canon_speed
+            clean_df["speed_mph"] = canon_speed
+
+            print(
+                "[info] speed canon: Trans Output Shaft RPM: "
+                + ("present" if has_oss else "missing")
+                + ", Vehicle Speed (SAE): "
+                + ("present" if has_sae else "missing"),
+                flush=True,
+            )
+
+            # --- TORQUE CANON: Engine Torque (ECM) + Trans Engine Torque (TCM)
+            has_tq_ecm = "Engine Torque" in df.columns
+            has_tq_trans = "Trans Engine Torque" in df.columns
+
+            torque_ecm = pd.Series(np.nan, index=idx, dtype="float64")
+            if has_tq_ecm:
+                torque_ecm = pd.to_numeric(df["Engine Torque"], errors="coerce")
+
+            torque_trans = pd.Series(np.nan, index=idx, dtype="float64")
+            if has_tq_trans:
+                torque_trans = pd.to_numeric(df["Trans Engine Torque"], errors="coerce")
+
+            torque_ecm_valid = torque_ecm.replace([np.inf, -np.inf], np.nan)
+            torque_trans_valid = torque_trans.replace([np.inf, -np.inf], np.nan)
+
+            canon_torque = pd.Series(np.nan, index=idx, dtype="float64")
+            m_ecm = torque_ecm_valid.notna()
+            m_trans = (~m_ecm) & torque_trans_valid.notna()
+
+            canon_torque[m_ecm] = torque_ecm_valid[m_ecm]
+            canon_torque[m_trans] = torque_trans_valid[m_trans]
+
+            clean_df["engine_torque_ecm"] = torque_ecm_valid
+            clean_df["engine_torque_trans"] = torque_trans_valid
+            clean_df["engine_torque"] = canon_torque
+
+            print(
+                "[info] torque canon: Engine Torque: "
+                + ("present" if has_tq_ecm else "missing")
+                + ", Trans Engine Torque: "
+                + ("present" if has_tq_trans else "missing"),
+                flush=True,
+            )
+
             # Add canonical time axis into clean_df.
             clean_df["time_s"] = df["time_s"].values
 
@@ -675,6 +769,8 @@ def main():
             direct = [
                 "time_s",
                 "speed_mph",
+                "speed_mph_sae",
+                "speed_mph_outputshaft",
                 "throttle_pct",
                 "pedal_pct",
                 "gear_actual",
@@ -682,6 +778,9 @@ def main():
                 "brake",
                 "tcc_slip_fused",
                 "tcc_locked_built",
+                "engine_torque",
+                "engine_torque_ecm",
+                "engine_torque_trans",
             ]
             for c in direct:
                 if c in clean_df.columns:
