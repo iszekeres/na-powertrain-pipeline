@@ -1,0 +1,220 @@
+NA Powertrain Tuning – Project Memory Export
+Generated: 2025-11-19T20:34:10.851516
+
+This file captures the persistent project memories / context that have been guiding the NA Powertrain Tuning work
+in ChatGPT. Each item roughly corresponds to a saved "memory" entry.
+
+1. Default HP Tuners VCM Scanner channel pack
+   - Preferred format: ParameterID-based .channels.xml
+   - Default working pack name: TransFAST-FromGreg
+   - Core ParameterIDs: [12, 13, 36, 37, 2111, 2113, 2114, 2700, 2701, 2705, 2734–2741, 2746–2749, 2764, 2765, 4501, 4502, 12703–12705].
+   - Use 10 ms interval for RPM/shaft speed IDs (12, 13, 12703, 12704, 12705).
+
+2. Canonical AllChannels PID↔Name map
+   - Stored under /mnt/data/02_Channel_Maps/ (AllChannels_PID_Name_Map__latest.*).
+   - Legacy Spark_* mapping files kept as aliases.
+   - Use this map for generating future channels.xml packs.
+
+3. Canonical shift table format
+   - Tahoe/HP Tuners format with 17-point throttle axis:
+     0, 6, 12, 19, 25, 31, 37, 44, 50, 56, 62, 69, 75, 81, 87, 94, 100.
+   - Header line: 'mph ... %'.
+   - Row labels like '1 -> 2 Shift', '2 -> 1 Shift'.
+   - Generate both UP and DOWN tables in this format.
+   - Slip tables are FINAL and must never be modified.
+
+4. Shared project area on disk
+   - Canonical path: /mnt/data/Project_Files/NA_Powertrain_Tuning.
+   - Important items:
+     • ShiftTables_Throttle17/SHIFT_TABLES__Throttle17__HandOff__LATEST.zip
+     • SlipTables_HYBRID_5to20/NA_Trans_TCC_SlipTables__HandOff__LATEST.zip
+     • Channels/Trans-FAST.channels.xml
+   - All use 17-pt throttle axis & 'mph … %' header.
+
+5. Active baseline
+   - “cam4350” torque-first neutral starter (Throttle17) is the baseline.
+   - Baseline folder: /mnt/data/06_Logs/Trans_Review/BASELINE.
+   - Contains the four anchor tables: SHIFT UP/DOWN + TCC APPLY/RELEASE.
+   - Default source for Mode B blending.
+
+6. Tahoe vehicle & mods (L83/6L80 project)
+   - 2015 Tahoe, 6L80 (T43), 4WD, FD 3.08, 32.5" tire.
+   - BTR Stage 1 v2 truck cam (~4350 rpm torque peak, 112 LSA, +4° phaser lockout).
+   - L86 intake & throttle, K&N Blackhawk CAI.
+   - Speed Engineering shorty headers, MagnaFlow 18" straight-through muffler, 3rd-cat delete.
+   - Vacuum pump delete; TBV delete noted.
+
+7. Table resolution policy
+   - All SHIFT UP/DOWN and TCC APPLY/RELEASE tables use 0.1 mph resolution.
+   - Lockout sentinels 318/317 are preserved exactly (no decimals).
+
+8. Global change policy
+   - Always use full Tahoe context (FD, tire, cam, TBV, WOT RPM per gear, current tables).
+   - Make changes holistically across entire rows/columns.
+   - Enforce:
+     • Monotonic TPS across all bins.
+     • DOWN < UP hysteresis (per matching TPS bin).
+     • WOT guardrail policy (per-gear RPM caps).
+     • TCC lockout policy.
+     • 0.1 mph formatting with 317/318 preserved.
+   - Run full-table audit after any change.
+
+9. Pre-flash audit requirement
+   - Full-table audit must run before any flash.
+   - Checks:
+     • 17-pt TPS header.
+     • 0.1 mph formatting + 317/318 preserved.
+     • UP/DOWN monotonic across TPS bins.
+     • DOWN ≤ UP − 1.0 mph at matching TPS bins.
+     • TCC lockout policy.
+   - Audit emits “__AUDITFIX__” pack for flashing.
+
+10. SOP: Trans Table Review & Edit
+    - Follow “Trans Table Review & Edit” doc for Tahoe L83/6L80.
+    - Load full mods file + complete UP/DOWN/TCC tables (Comfort & Performance).
+    - Enforce global constraints & WOT guardrails.
+    - Run full-table audit → __AUDITFIX__ pack pre-flash.
+
+11. Neutral-first pipeline docs
+    - Neutral-first build + FastCache documented under project Docs.
+    - Prefer neutral build seeded from torque-first baseline; overlays applied late.
+
+12. Pipeline update (2025-11-08): Extra passes & Corner-Exit
+    - Canonical headers: pedal_pct, throttle_pct, gear_actual, gear_cmd, time_s.
+    - extra_passes_preflight.py validates coverage (strict/no-fallback).
+    - Corner exit passes (core + chassis) produce small DOWN deltas around 8–30 mph.
+
+13. CLEAN_FULL-only pipeline
+    - Only __trans_focus__clean_FULL__*.csv is used (no small CLEAN).
+    - Directory layout: ./newlogs, ./newlogs/cleaned, ./newlogs/output/00_cleaner, ./newlogs/_staging_Review.
+    - All builders/passes read from CLEAN_FULL.
+
+14. INTENT pass locked
+    - driver_intent_pass_weighted__PLUS_v3.py is canonical.
+    - “REALISTIC” warmed run: ECT/TFT ≥100°F, specific throttle-rate thresholds, small UP deltas, small TCC release deltas.
+    - Outputs: INTENT__SHIFT_UP__DELTA.tsv and INTENT__TCC_RELEASE__DELTA.tsv.
+
+15. TCC neutral-first workflow
+    - Build TCC_APPLY/RELEASE Throttle17 → overlay_polish_v3 (SHIFT only) → table_audit_and_fix for all four tables.
+    - Enforce RELEASE ≥ APPLY +1.1 mph, DOWN ≤ UP −1.0 mph; 0.1 mph rounding; 317/318 preserved.
+
+16. Folder layout for tables
+    - SHIFT tables: newlogs/output/01_tables/shift/.
+    - TCC tables:  newlogs/output/01_tables/tcc/.
+    - Neutral candidate: newlogs/output/01_tables/NEUTRAL_CANDIDATE/.
+
+17. Baseline generation policy
+    - Do not use legacy shift/TCC tables.
+    - Base schedule from torque-first neutral “cam4350” profile.
+    - Style overlays applied only at end, on demand.
+
+18. Preflight & audit scripts
+    - Always run neutral audit (assert_neutral_tables_ok.py) and 0.1-mph enforcement.
+    - force_1dp scripts for SHIFT/TCC, preserving sentinels.
+
+19. User preference: strict/no-fallback
+    - No fallback channels; fail loudly and list missing headers.
+    - strict/no-fallback preflight is default for all passes.
+
+20. CORNER pass combination policy
+    - Run core & chassis variants then combine via elementwise max into CORNER__SHIFT_DOWN__DELTA__COMBINED.tsv.
+    - Default coverage knobs documented (min-hits, speed windows, chassis gates).
+
+21. Pass ordering snapshot
+    - Pass order in isolation: CONSIST → CORNER (core+chassis+combine) → LAT → STOPGO → KICKDOWN → CRUISE/TIP-IN → TCC_EDGE.
+
+22. Pass outputs location
+    - All pass outputs under newlogs/output/02_passes/<PASS>.
+
+23. TCC EC³ tools
+    - Use soft-lock interpretation with tcc_slip_fused or Engine−ISS slip.
+    - EC³ thresholds and coverage rules adopted (no TCC deltas unless coverage is adequate).
+
+24. Tahoe mods as source of truth
+    - Always consult mods file for WOT shift RPM caps per gear, vehicle parameters, etc.
+
+25. Overlay polish constraints
+    - overlay_polish_v3.py runs only on SHIFT tables.
+    - table_audit_and_fix + assert_neutral_tables_ok gate TCC separately.
+
+26. Neutral candidate tables
+    - Neutral SHIFT UP/DOWN and TCC APPLY/RELEASE built and audited into NEUTRAL_CANDIDATE folder.
+
+27. TCC Fix Pack
+    - tcc_table_builder_Throttle17__FIX.py and strict 0.1-mph TCC enforcement.
+    - Use tcc_gap_fix__robust last, only as needed for RELEASE ≥ APPLY + 1.1 mph.
+
+28. Conversation name
+    - This project thread known internally as “pipeline chat 2”.
+
+29. User preferences
+    - User has difficulty typing and poor memory.
+    - Prefers single-paste commands and concise, explicit progress messages.
+    - Wants persistent, always-up-to-date pipeline docs and snapshots.
+
+30. TSV escape guard
+    - tsv_escape_guard.py normalizes headers, fixes literal escapes, enforces 0.1 mph, preserves 317/318.
+    - TCC row labels standardized (3rd/4th/5th/6th Apply/Release).
+
+31. Neutral-first, strict/no-fallback runbooks
+    - Runbooks live under project Docs; single-paste PowerShell blocks preferred.
+
+32. Slip tables policy
+    - 9×9 slip tables are immutable.
+    - Always include slip tables in neutral seed ZIP under 01_tables/slip/.
+
+33. Script-list preference
+    - Keep a running list of active pipeline scripts on request so user can zip/archive them.
+
+34. Project snapshot tracking
+    - Maintain snapshots of pipeline state, passes, and outputs with dates.
+    - Provide one-paste commands to reproduce runs.
+
+35. LOG-FIRST policy
+    - Derive schedules from logs wherever possible.
+    - Neutral/Mode B blending is optional and off by default unless requested.
+
+36. Pass checklist
+    - Track CONSIST, STOPGO, KICKDOWN, CORNER, LAT, INTENT, TCC_EDGE and note which use Tahoe-specific thresholds and BESTINTERP.
+
+37. TCC EC³ update (slip thresholds)
+    - Soft-lock defined as |slip| ≤ 50 rpm; unlock as |slip| ≥ 120 rpm, for gears 3–6, speed ≥25 mph, no temp gating by default.
+
+38. RAW_PREFILTER_GENERIC note
+    - Future Stage -1 pre-clean step to trim large “Greg” logs to smaller channel subsets before CLEAN_FULL.
+
+39. Subproject name: RAW_PREFILTER_GENERIC
+    - Same as 38; a placeholder for future work.
+
+40. Long-term tune goals
+    - Two main tunes: Comfort (ultra-plush GT) and Performance (max-aggressive but safe).
+    - User is flexible on TCC lock rules; durability prioritized.
+
+41. Converter hardware
+    - Stock single-disc EC3 converter (no high-stall aftermarket converter).
+
+42. Sean Boyle video series
+    - Treat 6L80 HP Tuners experiment videos as key external knowledge; includes Tecum, AFL, line pressure, clutch control insights.
+
+43. Reference library (2025-11-19 additions)
+    - Engine.pdf, Transmission.pdf, Driveline-Axle.pdf, General Information.pdf.
+    - EC³ Torque Converter Clutch Strategy PDF and Shift Quality Metrics PDF.
+    - transcripts.txt (video transcripts) and trans_service.txt (service notes).
+    - Slip tables how-to pack ZIPs (non-browsable via myfiles tool but present on disk).
+
+44. Project vs non-project chats
+    - User prefers to work in regular chats (not Projects) so GitHub and other connectors are available.
+
+45. Always-updated pipeline snapshot
+    - Maintain a living description of pipeline scripts, outputs, and folders for the user.
+
+46. Harshness & metrics work
+    - Metrics doc (shift quality/harshness) used to guide future passes and evaluations.
+
+47. TCC EC³ heavy-SUV strategy
+    - Strategy doc (EC³ torque converter clutch in a heavy SUV) guides TCC APPLY/RELEASE in Comfort vs Performance.
+
+48. Export preference
+    - User wants the ability to export notes, docs, and pipeline state into files/zips they can move to new chats or tools.
+
+End of memory export.

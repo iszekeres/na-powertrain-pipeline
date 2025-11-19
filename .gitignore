@@ -10,3 +10,6 @@ __legacy_quarantine/
 # Python cache
 __pycache__/
 *.pyc
+
+# Project export archives (keep bundles/* tracked)
+NA_Trans_Project_Export__*.zip
