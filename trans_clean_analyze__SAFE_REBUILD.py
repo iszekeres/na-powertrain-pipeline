@@ -112,19 +112,39 @@ def find_shift_mode_column(columns):
 
 def normalize_shift_mode(value):
     """
-    Normalize raw shift-mode string into one of:
-        - 'pattern_a'
+    Normalize raw shift-mode string into a 4-state enum:
         - 'normal'
+        - 'normal_wot'
+        - 'pattern_a'
+        - 'pattern_a_wot'
         - 'unknown'
+
+    We assume the raw channel will mostly hold:
+        - 'Normal'
+        - 'Normal WOT'
+        - 'Pattern A'
+        - 'Pattern A WOT'
+    (plus NaNs). If a new value appears, it will map to 'unknown' and we can
+    inspect it later.
     """
     if pd.isna(value):
         return "unknown"
+
     s = str(value).strip().lower()
-    # Treat anything with both "pattern" and "a" as PATTERN A
-    if "pattern" in s and "a" in s:
+
+    # Explicit mapping for Pattern A cases
+    if s in ("pattern a", "pattern_a"):
         return "pattern_a"
+    if s in ("pattern a wot", "pattern_a wot"):
+        return "pattern_a_wot"
+
+    # Explicit mapping for Normal cases
     if s == "normal":
         return "normal"
+    if s == "normal wot":
+        return "normal_wot"
+
+    # Anything else is treated as unknown so we can detect new values later.
     return "unknown"
 
 
@@ -135,9 +155,11 @@ def annotate_shift_mode(df, log_name=None):
 
     Adds:
         - shift_mode_raw
-        - shift_mode_canon
+        - shift_mode_state_canon  (4-state, forward-filled)
+        - shift_mode_canon        (3-state mode only, forward-filled)
         - mode_profile
         - mode_is_pattern_a
+        - mode_is_wot
 
     If no shift-mode column exists, leaves df unchanged.
     """
@@ -151,27 +173,54 @@ def annotate_shift_mode(df, log_name=None):
         return df
 
     raw = df[mode_col]
-    canon = raw.map(normalize_shift_mode)
+
+    # First pass: direct normalization into 4-state enum.
+    state_raw = raw.map(normalize_shift_mode)
+
+    # CHANGE-STATE + CARRY-FORWARD:
+    # Treat 'unknown' as "no new sample", forward-fill the last known state,
+    # then leave any leading "no-sample" region as 'unknown'.
+    state_ffill = state_raw.replace("unknown", pd.NA).ffill().fillna("unknown")
+
+    # 3-state mode-only canon derived from 4-state
+    def mode_from_state(state):
+        if state in ("pattern_a", "pattern_a_wot"):
+            return "pattern_a"
+        if state in ("normal", "normal_wot"):
+            return "normal"
+        return "unknown"
+
+    mode_canon = state_ffill.map(mode_from_state)
+
+    # WOT flag from 4-state
+    is_wot = state_ffill.isin(["normal_wot", "pattern_a_wot"]).astype(int)
 
     df["shift_mode_raw"] = raw
-    df["shift_mode_canon"] = canon
-    df["mode_profile"] = canon.map(
+    df["shift_mode_state_canon"] = state_ffill
+    df["shift_mode_canon"] = mode_canon
+
+    df["mode_profile"] = mode_canon.map(
         {"pattern_a": "performance", "normal": "comfort"}
     ).fillna("unknown")
-    df["mode_is_pattern_a"] = (canon == "pattern_a").astype(int)
 
-    # Optional small summary
-    counts = canon.value_counts(dropna=False).to_dict()
+    df["mode_is_pattern_a"] = (mode_canon == "pattern_a").astype(int)
+    df["mode_is_wot"] = is_wot
+
+    # Summary
+    counts = mode_canon.value_counts(dropna=False).to_dict()
     normal_count = counts.get("normal", 0)
     pattern_count = counts.get("pattern_a", 0)
     unknown_count = counts.get("unknown", 0)
+
+    wot_count = int(is_wot.sum())
 
     if log_name is None:
         log_name = "<cleaned_df>"
 
     print(
         f"{log_name}: shift-mode counts -> "
-        f"normal={normal_count}, pattern_a={pattern_count}, unknown={unknown_count}"
+        f"normal={normal_count}, pattern_a={pattern_count}, unknown={unknown_count}, "
+        f"wot_rows={wot_count}"
     )
 
     return df
