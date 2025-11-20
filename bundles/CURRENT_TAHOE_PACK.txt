@@ -1,0 +1,5 @@
+﻿# Current Tahoe 6L80 table pack
+# Updated: 2025-11-19 22:27:35 -06:00
+# Directory: C:\tuning\git\na-trans\bundles
+
+Tahoe_6L80_Pack__ComfortGT_RowdyPerf__v4_FULL__2025-11-18.zip
