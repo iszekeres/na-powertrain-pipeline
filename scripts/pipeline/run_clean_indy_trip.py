@@ -41,6 +41,10 @@ def main():
     for idx, raw_file in enumerate(csv_files, start=1):
         cleaned_name = f"{raw_file.stem}__clean_full.csv"
         cleaned_path = cleaned_dir / cleaned_name
+        summary_target = analyze_dir / f"__trans_focus__summary__{cleaned_name}.txt"
+        if cleaned_path.exists() and summary_target.exists():
+            print(f"[{idx}/{total}] skip {raw_file.name} (already processed)")
+            continue
         print(f"[{idx}/{total}] clean {raw_file.name} -> {cleaned_name}")
         try:
             subprocess.check_call(
