@@ -1,0 +1,12 @@
+Drivetrain efficiency (clamped 0.80-0.92):
+  Gear 3: 0.8600
+  Gear 4: 0.8600
+  Gear 5: 0.8600
+  Gear 6: 0.8600
+
+Speed-space physics surface rows: 0
+
+Downshift speed bins torque gains:
+  No valid coverage.
+
+No downshift boundary data.

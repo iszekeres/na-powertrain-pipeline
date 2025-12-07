@@ -1,0 +1,6 @@
+Hybrid surface rows: 0
+
+Hybrid downshift rows: 0
+
+Downshift hybrid torque gains:
+  No valid coverage.

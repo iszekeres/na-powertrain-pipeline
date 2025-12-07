@@ -1,0 +1,19 @@
+Drivetrain efficiency (clamped 0.80-0.92):
+  Gear 3: 0.8600
+  Gear 4: 0.8600
+  Gear 5: 0.8600
+  Gear 6: 0.8600
+
+Physics vs ECM RPM-space delta median: n/a
+
+6th gear mid-pedal lock ratio: 98.5% (95th percentile slip 121.4 rpm)
+
+Shift bias suggestions for 6->5 (mph where Δtq>40 lbft):
+  No valid coverage.
+
+Shift bias suggestions for 5->4 (mph where Δtq>40 lbft):
+  No valid coverage.
+
+No high-slip torque multiplication detected.
+
+No downshift boundary data.

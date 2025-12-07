@@ -1,0 +1,10 @@
+Global fuel economy summary (burblock5)
+---------------------------------------
+Total distance: 42.24 miles
+Total fuel:     2.817 gallons
+Average MPG:    14.99
+
+Highway slice (speed 55.0-80.0 mph, gear>=5, TCC LOCKED):
+  Distance: 1.55 miles
+  Fuel:     0.036 gallons
+  MPG:      43.07
