@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Runner that cleans and analyzes the indy trip logs using the new NA Trans scripts.
 """
